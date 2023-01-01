@@ -1,0 +1,237 @@
+class DataLoader:
+    def __init__(self, data_root) -> None:
+        """
+        data_root: str, 数据路径
+        """
+        self.data_root = data_root
+        self.categories = sorted(os.listdir(data_root))
+        self.label_dict = {self.categories[i]: i for i in range(len(self.categories))}
+
+        # 获取数据集的图像大小 前提是所有图片大小都相同
+        imgs_example = os.listdir(os.path.join(self.data_root, self.categories[0]))
+        img_eg = cv2.imread(os.path.join(self.data_root, self.categories[0], imgs_example[0]))
+        self.img_size = img_eg.shape
+    
+    def get_features_and_labels(self, feature='hog', ratio=0.8, mode='train'):
+        """
+        feature: str, 特征类型
+        ratio: float, 划分训练集: 测试集的比例 
+        mode: str, 读取训练集还是测试集 节省时间
+
+        return:
+        n_features, np.ndarray, shape: (N_samples, feature_dim)
+        n_labels, np.ndarray, shape: (N_samples, )
+        """
+        n_features_train, n_features_test = [], []
+        n_lables_train, n_labels_test = [], []
+
+        if not feature == 'hog':
+            raise NotImplementedError  # SIFT 暂未实现
+        
+        win_size, block_size, block_stride, cell_size = self.set_hog_params([self.img_size[0], self.img_size[1]], 
+                                                            (32, 32), (2, 2))
+        descriptor = cv2.HOGDescriptor(win_size, block_size, block_stride, cell_size, 9)
+
+        if not os.path.exists('./split'):
+            os.makedirs('./split')
+        
+        for cat in self.categories:
+            imgs = os.listdir(os.path.join(self.data_root, cat))
+
+            if mode == 'train':  # 训练模式 生成随机序列并保存
+                per = np.random.permutation(len(imgs))  # 随机生成一个排列
+                np.save(f'./split/{cat}.npy', per)
+            else:  # 测试模式 读取划分的索引
+                per = np.load(f'./split/{cat}.npy')
+            # 打乱当前图片排序
+            imgs_bak = imgs.copy()
+            for idx in range(len(imgs)):
+                imgs[idx] = imgs_bak[per[idx]]
+
+            bound_idx = int(len(imgs) * ratio)  # 划分的边界索引 0: boundidx - 1 为训练集 boundidx: 为测试集
+
+            if mode == 'train':  # 读取训练集
+                for img_name in imgs[: bound_idx]:
+                    img = cv2.imread(os.path.join(self.data_root, cat, img_name), cv2.IMREAD_GRAYSCALE)
+                    img = self.norm_images(img)
+                    n_features_train.append(descriptor.compute(img))  # 计算HOG特征并加入features
+                    n_lables_train.append(self.label_dict[cat])  # 加入相应label
+            
+            else:  # 读取测试集
+                for img_name in imgs[bound_idx: ]:
+                    img = cv2.imread(os.path.join(self.data_root, cat, img_name))
+                    img = self.norm_images(img)
+                    n_features_test.append(descriptor.compute(img))  # 计算HOG特征并加入features
+                    n_labels_test.append(self.label_dict[cat])  # 加入相应label
+            
+
+        return np.asarray(n_features_train), np.asarray(n_lables_train), np.asarray(n_features_test), np.asarray(n_labels_test)
+
+    def norm_images(self, img):
+        """
+        归一化图像
+
+        img: np.ndarray 读取的图像
+        """
+        img_ = img
+        img_ = img_ / img_.max()
+        img_ *= 255
+        return img_.astype(np.uint8)
+        
+            
+    def set_hog_params(self, img_shape, cell_size, num_cell_per_block):
+        """
+        设置HOG描述子参数
+
+        img_shape: tuple or list, 图像高宽
+        cell_size: tuple or list, 每个cell的高宽
+        num_cell_per_block:, int, 每个block中有多少cell
+        """
+        block_size = (num_cell_per_block[0] * cell_size[0], num_cell_per_block[1] * cell_size[1])
+        x_cells = img_shape[1] // cell_size[0]
+        y_cells = img_shape[0] // cell_size[1]
+        h_stride = 1
+        v_stride = 1
+        block_stride = (cell_size[0] * h_stride, cell_size[1] * v_stride)
+        win_size = (x_cells * cell_size[0] , y_cells * cell_size[1])
+
+        return win_size, block_size, block_stride, cell_size
+
+
+train.py:
+
+"""
+训练代码
+
+基本思路:
+1. 提取图像特征
+2. k-means聚类
+3. 对于一个样本 与聚类中心点结合 进一步编码特征
+"""
+
+import os
+import argparse
+
+import numpy as np
+from sklearn import svm
+from sklearn.cluster import KMeans
+from utils.dataset import DataLoader
+from utils.cal_distance import cal_eculid_dist
+import pickle
+
+def main(opts):
+    
+    # 1. 加载数据集并得到特征与标签
+    print('加载数据集...')
+    loader = DataLoader(data_root=opts.data_root)
+    features_trian, labels_train, _, _ = loader.get_features_and_labels(feature=opts.feature, ratio=opts.ratio)
+
+    # 2. k-means聚类获得codebooks
+    print('聚类...')
+    k_means_cluster = KMeans(n_clusters=opts.cluster_num)
+    k_means_fitter = k_means_cluster.fit(features_trian)
+
+    codebooks = k_means_fitter.cluster_centers_  # 聚类中心即为所谓的bag of words  shape: (cluster_num, n_dim)
+    # 保存结果
+    if not os.path.exists('./weights'):
+        os.makedirs('./weights')
+
+    np.save('./weights/codebooks.npy', codebooks)
+    # 3. SVM训练
+    # 对每个样本 计算与每个聚类中心的欧氏距离 编码为新特征
+    
+    print('训练SVM...')
+    features_trian_encoded = []
+    for feature in features_trian:
+        features_trian_encoded.append(cal_eculid_dist(feature, codebooks).reshape(opts.cluster_num, ))
+
+    features_trian_encoded = np.asarray(features_trian_encoded)
+    SVM_ = svm.LinearSVC()
+    SVM_.fit(features_trian_encoded, labels_train)
+    # 保存结果
+    with open('./weights/svm.pickle', 'wb') as f:
+        pickle.dump(SVM_, f)
+
+    # 4. 评估训练集准确率
+    print('评估...')
+    labels_pred = SVM_.predict(features_trian_encoded)
+    acc = sum( labels_pred == labels_train) / len(labels_train)
+    print('训练集准确率为{}%'.format(acc * 100))
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument('--data_root', type=str, default='/data/wujiapeng/datasets/MSTAR', help='数据集路径')
+    parser.add_argument('--feature', type=str, default='hog', help='特征类别 hog 或 sift')
+    parser.add_argument('--cluster_num', type=int, default=512, help='聚类个数')
+    parser.add_argument('--ratio', type=float, default=0.7, help='训练集与测试集数量比值')
+
+    opts = parser.parse_args()
+
+    main(opts)
+
+
+test.py:
+"""
+测试代码
+
+基本思路:
+1. 读取存储的聚类中心点(codebooks)和SVM模型权重
+2. 推理
+3. 评估准确率
+"""
+
+import os
+import argparse
+
+import numpy as np
+from sklearn import svm
+from sklearn.cluster import KMeans
+from utils.dataset import DataLoader
+from utils.cal_distance import cal_eculid_dist
+import pickle
+
+def main(opts):
+    
+    # 1. 加载数据集并得到特征与标签
+    print('加载数据集...')
+    loader = DataLoader(data_root=opts.data_root)
+    features_test, labels_test = loader.get_features_and_labels(feature=opts.feature, mode='test')
+
+    # 2. 加载codebook
+    print('加载词袋...')
+
+    codebooks = np.load('./weights/codebooks.npy')  # 聚类中心即为所谓的bag of words  shape: (cluster_num, n_dim)
+
+    # 3. SVM推理
+    # 对每个样本 计算与每个聚类中心的欧氏距离 编码为新特征
+    
+    print('SVM推理...')
+    features_test_encoded = []
+    for feature in features_test:
+        features_test_encoded.append(cal_eculid_dist(feature, codebooks).reshape(opts.cluster_num, ))
+
+    features_test_encoded = np.asarray(features_test_encoded)
+    # SVM_ = svm.LinearSVC()
+    with open('./weights/svm.pickle', 'rb') as f:
+        SVM_ = pickle.load(f)
+
+    # 4. 评估训练集准确率
+    print('评估...')
+    labels_pred = SVM_.predict(features_test_encoded)
+    acc = sum( labels_pred == labels_test) / len(labels_test)
+    print('测试集准确率为{}%'.format(acc * 100))
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument('--data_root', type=str, default='/data/wujiapeng/datasets/MSTAR', help='数据集路径')
+    parser.add_argument('--feature', type=str, default='hog', help='特征类别 hog 或 sift')
+    parser.add_argument('--cluster_num', type=int, default=512, help='聚类个数')
+    parser.add_argument('--ratio', type=float, default=0.7, help='训练集与测试集数量比值')
+
+    opts = parser.parse_args()
+
+    main(opts)
